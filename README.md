@@ -22,3 +22,8 @@
    
    For now, this code has not syntex errors but makes wrong result.<br>
 
+
+## References
+https://github.com/huggingface/transformers/tree/main/src/transformers/models/mamba
+
+
