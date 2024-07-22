@@ -24,7 +24,7 @@ from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 
 ##import beam search generation
 
-from recurrent_mamba import MambaCache, MambaForCausalLM
+from hugMamba import MambaForCausalLM
 
 ##data load
 tokenizer = AutoTokenizer.from_pretrained("state-spaces/mamba-130m-hf")
@@ -42,23 +42,14 @@ prompt = "My cat wrote all this CUDA code for a new language model and"
 model_input = tokenizer(prompt, max_length=max_length, truncation=True, return_tensors="pt").to('cuda')
 
 def beam_search(model, tokenizer, input_ids,beam_size=2, max_length=50):
-    config = MambaConfig()
-    new_cache = MambaCache(config, batch_size=1)
     finished_beams = []
-    for i in range(len(input_ids[0])-1):
-        outputs = model(input_ids[:,i].unsqueeze(1),cache_params=new_cache)
-        new_cache = copy.deepcopy(outputs.cache_params)
-        torch.cuda.nvtx.range_pop()
-    running_beam = [(0, input_ids, new_cache)]
+    running_beam = [(0, input_ids)]
 
-    torch.cuda.nvtx.range_push("Beam search 시작")
     while len(finished_beams) < beam_size and running_beam:
-        beam_score, new_input_ids, new_cache = running_beam.pop(0)
+        beam_score, new_input_ids = running_beam.pop(0)
         with torch.no_grad():
-            outputs = model(new_input_ids[:, -1].unsqueeze(1), cache_params=new_cache)
+            outputs = model(new_input_ids)
             logits = outputs.logits[:, -1, :]
-            new_cache = copy.deepcopy(outputs.cache_params)
-            # Choose top 2 (beam_size) tokens
             top_k_values, top_k_indices = torch.topk(logits, beam_size, dim=-1)
             
  
@@ -71,9 +62,9 @@ def beam_search(model, tokenizer, input_ids,beam_size=2, max_length=50):
             new_input_per_beam = torch.cat((input_ids_per_beam[i], token.unsqueeze(1)), dim=1)
 
             if token == tokenizer.eos_token_id or new_input_ids.shape[1] == max_length+14:
-                finished_beams.append((beam_score + score, new_input_per_beam, new_cache))
+                finished_beams.append((beam_score + score, new_input_per_beam))
             else:
-                running_beam.append((beam_score + score, new_input_per_beam, new_cache))
+                running_beam.append((beam_score + score, new_input_per_beam))
 
         # Sort the running beams by score
         running_beam.sort(key=lambda x: x[0], reverse=True)

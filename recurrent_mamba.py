@@ -7,15 +7,15 @@ import torch.utils.checkpoint
 from torch import nn
 from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
-
+import gc
 from transformers import PreTrainedModel, MambaConfig
 from transformers import AutoTokenizer, MambaForCausalLM
 from datasets import load_dataset
-
+import copy
 from packaging import version
 from typing import Any, ContextManager, Iterable, List, Tuple
 from functools import partial
-from einops import rearrange
+from einops import rearrange, repeat
 #mamba import
 # from copied_selective_scan_interface import mamba_inner_fn, selective_scan_fn
 from mamba_ssm.ops.selective_scan_interface import mamba_inner_fn, selective_scan_fn
@@ -92,6 +92,165 @@ def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta
     out = out.to(dtype=dtype_in)
     return out if not return_last_state else (out, last_state)
 
+def selective_state_update_ref(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False):
+    """
+    Argument:
+        state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
+        x: (batch, dim) or (batch, nheads, dim)
+        dt: (batch, dim) or (batch, nheads, dim)
+        A: (dim, dstate) or (nheads, dim, dstate)
+        B: (batch, dstate) or (batch, ngroups, dstate)
+        C: (batch, dstate) or (batch, ngroups, dstate)
+        D: (dim,) or (nheads, dim)
+        z: (batch, dim) or (batch, nheads, dim)
+        dt_bias: (dim,) or (nheads, dim)
+    Return:
+        out: (batch, dim) or (batch, nheads, dim)
+    """
+    if dt_bias is not None:
+        dt = dt + dt_bias
+    dt = F.softplus(dt) if dt_softplus else dt
+    #dA = torch.exp(rearrange(dt, "b h d -> b h d 1") * A)  # (batch, nheads, dim, dstate)
+    dA = torch.exp(torch.einsum("bd,dn->bn",dt,A))
+    # B = repeat(B, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
+    # C = repeat(C, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
+    #dB = rearrange(dt, "b h d -> b h d 1") * rearrange(B, "b h n -> b h 1 n")  # (batch, nheads, dim, dstate)
+    dB = torch.einsum("bd,bn->bdn",dt,B)
+    #state.copy_(state * dA + dB * rearrange(x, "b h d -> b h d 1"))  # (batch, dim, dstate
+    #state.copy_(state * dA + dB * x)  # (batch, dim, dstate
+    
+    state.copy_(state * dA + torch.einsum("bdn,bd->bdn",dB,x))
+    out = torch.einsum("bdn,bn->bd", state.to(C.dtype), C)
+    if D is not None:
+        out += (x * D).to(out.dtype)
+    out = (out if z is None else out * F.silu(z)).to(x.dtype)
+    
+    return out
+
+def selective_state_update_ref_ori(state, x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False):
+    """
+    Argument:
+        state: (batch, dim, dstate) or (batch, nheads, dim, dstate)
+        x: (batch, dim) or (batch, nheads, dim)
+        dt: (batch, dim) or (batch, nheads, dim)
+        A: (dim, dstate) or (nheads, dim, dstate)
+        B: (batch, dstate) or (batch, ngroups, dstate)
+        C: (batch, dstate) or (batch, ngroups, dstate)
+        D: (dim,) or (nheads, dim)
+        z: (batch, dim) or (batch, nheads, dim)
+        dt_bias: (dim,) or (nheads, dim)
+    Return:
+        out: (batch, dim) or (batch, nheads, dim)
+    """
+    has_heads = state.dim() > 3
+    if state.dim() == 3:
+        state = state.unsqueeze(1)
+    if x.dim() == 2:
+        x = x.unsqueeze(1)
+    if dt.dim() == 2:
+        dt = dt.unsqueeze(1)
+    if A.dim() == 2:
+        A = A.unsqueeze(0)
+    if B.dim() == 2:
+        B = B.unsqueeze(1)
+    if C.dim() == 2:
+        C = C.unsqueeze(1)
+    if D is not None and D.dim() == 1:
+        D = D.unsqueeze(0)
+    if z is not None and z.dim() == 2:
+        z = z.unsqueeze(1)
+    if dt_bias is not None and dt_bias.dim() == 1:
+        dt_bias = dt_bias.unsqueeze(0)
+    batch, nheads, dim, dstate = state.shape
+    assert x.shape == (batch, nheads, dim)
+    assert dt.shape == x.shape
+    assert A.shape == (nheads, dim, dstate)
+    ngroups = B.shape[1]
+    assert nheads % ngroups == 0, "nheads must be divisible by ngroups"
+    assert B.shape == (batch, ngroups, dstate)
+    assert C.shape == B.shape
+    if D is not None:
+        assert D.shape == (nheads, dim)
+    if z is not None:
+        assert z.shape == x.shape
+    if dt_bias is not None:
+        assert dt_bias.shape == (nheads, dim)
+        dt = dt + dt_bias
+    dt = F.softplus(dt) if dt_softplus else dt
+    dA = torch.exp(rearrange(dt, "b h d -> b h d 1") * A)  # (batch, nheads, dim, dstate)
+    B = repeat(B, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
+    C = repeat(C, "b g n -> b (g h) n", h=nheads // ngroups)  # (batch, nheads, dstate)
+    dB = rearrange(dt, "b h d -> b h d 1") * rearrange(B, "b h n -> b h 1 n")  # (batch, nheads, dim, dstate)
+    state.copy_(state * dA + dB * rearrange(x, "b h d -> b h d 1"))  # (batch, dim, dstate
+    out = torch.einsum("bhdn,bhn->bhd", state.to(C.dtype), C)
+    if D is not None:
+        out += (x * D).to(out.dtype)
+    out = (out if z is None else out * F.silu(z)).to(x.dtype)
+    if not has_heads:
+        out = out.squeeze(1)
+    return out
+
+def recur(last_state, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
+                      return_last_state=False):
+    """
+    u: r(B D L)
+    delta: r(B D L)
+    A: c(D N) or r(D N)
+    B: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+    C: c(D N) or r(B N L) or r(B N 2L) or r(B G N L) or (B G N L)
+    D: r(D)
+    z: r(B D L)
+    delta_bias: r(D), fp32
+
+    out: r(B D L)
+    last_state (optional): r(B D dstate) or c(B D dstate)
+    """
+    dtype_in = u.dtype
+    u = u.float()
+
+    delta = delta.float()
+    delta = delta
+    if delta_bias is not None:
+        delta = delta + delta_bias[..., None ].float()
+    if delta_softplus:
+        delta = F.softplus(delta)
+    batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
+
+    
+    B = B.float()
+    C = C.float()
+
+    B = B.transpose(1,2)
+    #print('C shape',C.shape)
+    #C = C.transpose(1,2)
+
+    ys = []
+
+    deltaA = torch.exp(torch.einsum('bdl, dn->bdln', delta, A))
+
+    if B.dim() == 3:
+        #delta = torch.einsum('bdl,bnl->bdln', delta, B)
+        # deltaB_u = torch.einsum('bdln,bdl->bdln', deltaB, u)
+        deltaB_u = torch.einsum('bdl,bln,bdl->bdln', delta, B, u)
+    else:
+        B = repeat(B, "B G N L -> B (G H) N L", H=dim // B.shape[1])
+        deltaB_u = torch.einsum('bdl,bln,bdl->bdln', delta, B, u)
+    
+    h_prev = last_state
+
+    h_cur = deltaA[:,:,0] * h_prev + deltaB_u[:,:,0]
+
+    y = torch.einsum('bdn,bn->bd', h_cur, C[:,0]).unsqueeze(2)
+    
+   # (batch dim L)
+
+    out = y if D is None else y + u * rearrange(D, "d -> d 1")
+    if z is not None:
+        out = out * F.silu(z)
+    out = out.to(dtype=dtype_in)
+    #del deltaB_u, y
+    gc.collect()
+    return out, h_cur
 
 def _model_output_flatten(output):
     return list(output.values()), list(output.keys())
@@ -264,22 +423,29 @@ class MambaCache:
     """
 
     def __init__(
-        self, config: MambaConfig, batch_size: int, dtype: torch.dtype = torch.float16, device: Optional[str] = None
+        self, config: MambaConfig, batch_size: int, dtype: torch.dtype = torch.float16
     ):
         self.seqlen_offset = 0
         self.dtype = dtype
         intermediate_size = config.intermediate_size
         ssm_state_size = config.state_size
-        conv_kernel_size = config.conv_kernel
+        # conv_kernel_size = config.conv_kernel
 
-        self.conv_states = {
-            i: torch.zeros(batch_size, intermediate_size, conv_kernel_size, device=device, dtype=dtype)
-            for i in range(config.num_hidden_layers)
-        }
+        # self.conv_states = {
+        #     i: torch.zeros(batch_size, intermediate_size, conv_kernel_size, device=device, dtype=dtype)
+        #     for i in range(config.num_hidden_layers)
+        # }
         self.ssm_states = {
-            i: torch.zeros(batch_size, intermediate_size, ssm_state_size, device=device, dtype=dtype)
+            i: torch.zeros(batch_size, intermediate_size, ssm_state_size, dtype=dtype).to('cuda')
             for i in range(config.num_hidden_layers)
         }
+    def __deepcopy__(self,memo):
+        # Custom deepcopy method
+        copied = MambaCache.__new__(MambaCache)
+        copied.dtype = self.dtype
+        copied.ssm_states = {k: v.clone() for k, v in self.ssm_states.items()}
+        # Add any other attributes that need to be deeply copied
+        return copied
 
 class MambaMixer(nn.Module):
     """
@@ -328,8 +494,13 @@ class MambaMixer(nn.Module):
         self.use_bias = config.use_bias
 
         
+    def cuda_kernels_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: Optional[MambaCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ):
 
-    def cuda_kernels_forward(self, hidden_states: torch.Tensor, cache_params: Optional[MambaCache] = None):
         # 1. Gated MLP's linear projection
         torch.cuda.nvtx.range_push("mamba block Forward Starts!")
         torch.cuda.nvtx.range_push("1. Gated MLP's linear projection (input projection) ")
@@ -359,22 +530,8 @@ class MambaMixer(nn.Module):
             # 2. Convolution sequence transformation
             torch.cuda.nvtx.range_push(" 2. Convolution sequence transformation")   
             conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-            if cache_params is not None and cache_params.seqlen_offset > 0:
-                hidden_states = causal_conv1d_update(
-                    hidden_states.squeeze(-1),
-                    cache_params.conv_states[self.layer_idx],
-                    conv_weights,
-                    self.conv1d.bias,
-                    self.activation,
-                )
-                hidden_states = hidden_states.unsqueeze(-1)
-            else:
-                if cache_params is not None:
-                    conv_states = nn.functional.pad(
-                        hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0)
-                    )
-                    cache_params.conv_states[self.layer_idx].copy_(conv_states)
-                hidden_states = causal_conv1d_fn(
+            
+            hidden_states = causal_conv1d_fn(
                     hidden_states, conv_weights, self.conv1d.bias, activation=self.activation
                 )
             torch.cuda.nvtx.range_pop()
@@ -398,8 +555,8 @@ class MambaMixer(nn.Module):
             # 3.c perform the recurrence y ← SSM(A, B, C)(x)
             torch.cuda.nvtx.range_push("3.c perform the recurrence y ← SSM(A, B, C)(x)") 
             
-            if cache_params is not None and cache_params.seqlen_offset > 0:
-                pass
+            # if cache_params is not None and cache_params.seqlen_offset > 0:
+            #     pass
                 # torch.cuda.nvtx.range_push("selective update") 
                 # scan_outputs = selective_state_update(
                 #     cache_params.ssm_states[self.layer_idx],
@@ -414,20 +571,33 @@ class MambaMixer(nn.Module):
                 #     dt_softplus=True,
                 # ).unsqueeze(-1)
                 # torch.cuda.nvtx.range_pop()
-            else:
-                scan_outputs, ssm_state = selective_scan_fn(
-                    hidden_states,
-                    discrete_time_step,
+            # else:
+            scan_outputs = selective_state_update_ref_ori(
+                    cache_params.ssm_states[self.layer_idx],
+                    hidden_states[..., 0],
+                    discrete_time_step[..., 0],
                     A,
-                    B.transpose(1, 2),
-                    C.transpose(1, 2),
-                    self.D.float(),
-                    gate,
+                    B[:, 0],
+                    C[:, 0],
+                    self.D,
+                    gate[..., 0],
                     time_proj_bias,
-                    delta_softplus=True,
-                    return_last_state=True,
-                )
-            
+                    dt_softplus=True,
+                ).unsqueeze(-1)
+            # scan_outputs, ssm_state = recur(
+            #         last_state,
+            #         hidden_states,
+            #         discrete_time_step,
+            #         A,
+            #         B,
+            #         C,
+            #         self.D.float(),
+            #         gate,
+            #         time_proj_bias,
+            #         delta_softplus=True,
+            #         return_last_state=True,
+            #     )
+                
             torch.cuda.nvtx.range_pop()
 
             # 4. Final linear projection
@@ -442,8 +612,13 @@ class MambaMixer(nn.Module):
 
     # fmt: on
 
-    def forward(self, hidden_states, cache_params: Optional[MambaCache] = None):
-        result = self.cuda_kernels_forward(hidden_states, cache_params)
+    def forward(
+        self,
+        hidden_states,
+        cache_params: Optional[MambaCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ):
+        result = self.cuda_kernels_forward(hidden_states, cache_params, cache_position)
         return result
 
 ##Mamba RMSNOrm
@@ -473,13 +648,18 @@ class MambaBlock(nn.Module):
         self.norm = MambaRMSNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         self.mixer = MambaMixer(config, layer_idx=layer_idx)
 
-    def forward(self, hidden_states, cache_params: Optional[MambaCache] = None):
+    def forward(
+        self,
+        hidden_states,
+        cache_params: Optional[MambaCache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ):
         residual = hidden_states
         hidden_states = self.norm(hidden_states.to(dtype=self.norm.weight.dtype))
         if self.residual_in_fp32:
             residual = residual.to(torch.float32)
 
-        hidden_states = self.mixer(hidden_states, cache_params=cache_params)
+        hidden_states = self.mixer(hidden_states, cache_params=cache_params, cache_position=cache_position)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -564,6 +744,7 @@ class MambaOutput(ModelOutput):
     last_hidden_state: Optional[torch.FloatTensor] = None
     cache_params: Optional[MambaCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    #last_states : Optional[dict] = None
 
 class MambaCausalLMOutput(ModelOutput):
     """
@@ -590,6 +771,7 @@ class MambaCausalLMOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
     cache_params: Optional[MambaCache] = None
     hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    #last_states : Optional[dict] = None
 
 class MambaModel(MambaPreTrainedModel):
     def __init__(self, config):
@@ -603,6 +785,11 @@ class MambaModel(MambaPreTrainedModel):
         # Initialize weights and apply final processing
         self._register_load_state_dict_pre_hook(self.load_hook)
         self.post_init()
+
+        # self.intermediate_size = config.intermediate_size
+        # self.ssm_state_size = config.state_size
+        # self.num_hidden_layers = config.num_hidden_layers
+        # self.batch_size = 1
 
     def load_hook(self, state_dict, prefix, *args):
         for k in state_dict:
@@ -625,55 +812,51 @@ class MambaModel(MambaPreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.LongTensor] = None,
         cache_params: Optional[MambaCache] = None,
         use_cache: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,  # `attention_mask` is passed by the tokenizer and we don't want it
     ) -> Union[Tuple, MambaOutput]:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if (input_ids is None) ^ (inputs_embeds is not None):  # ^ is python for xor
-            raise ValueError(
-                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
-            )
-            
+        #use_cache = use_cache if use_cache is not None else (self.config.use_cache if not self.training else False)
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict  
         
 
         torch.cuda.nvtx.range_push("첫번재 임베딩") 
         inputs_embeds = self.embeddings(input_ids)
         torch.cuda.nvtx.range_pop()
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            use_cache = False
+        # if self.gradient_checkpointing and self.training and use_cache:
+        #     use_cache = False
 
-        if cache_params is None and use_cache:
-            cache_params = MambaCache(
-                self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
-            )
+        # if cache_params is None and use_cache:
+        #     cache_params = MambaCache(
+        #         self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
+        #     )
 
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
+
         
-        for i, mixer_block in enumerate(self.layers):
+        for mixer_block in self.layers:
             if self.gradient_checkpointing and self.training:
-                hidden_states = self._gradient_checkpointing_func(mixer_block.__call__, hidden_states, cache_params)
+                hidden_states = self._gradient_checkpointing_func(
+                    mixer_block.__call__, hidden_states, cache_params, cache_position
+                )
             else:
-                torch.cuda.nvtx.range_push("%d 번째 mixer block ! "%i)
-                hidden_states = mixer_block(hidden_states, cache_params=cache_params)
-                torch.cuda.nvtx.range_pop()
+                hidden_states = mixer_block(hidden_states, cache_params=cache_params, cache_position=cache_position)
 
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-        if use_cache:
-            cache_params.seqlen_offset += inputs_embeds.shape[1]
+
+        # if use_cache:
+        #     cache_params.seqlen_offset += inputs_embeds.shape[1]
         
         torch.cuda.nvtx.range_push("norm")
         hidden_states = self.norm_f(hidden_states)
@@ -687,8 +870,8 @@ class MambaModel(MambaPreTrainedModel):
 
         return MambaOutput(
             last_hidden_state=hidden_states,
-            cache_params=cache_params if use_cache else None,
-            hidden_states=all_hidden_states,
+            cache_params=cache_params,
+            hidden_states=all_hidden_states
         )
 
 class MambaForCausalLM(MambaPreTrainedModel):
@@ -759,6 +942,7 @@ class MambaForCausalLM(MambaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.Tensor] = None,
         **kwargs,  # for now we need this for generation
     ) -> Union[Tuple, MambaCausalLMOutput]:
         r"""
@@ -776,12 +960,11 @@ class MambaForCausalLM(MambaPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             use_cache=use_cache,
+            cache_position=cache_position,
         )
         hidden_states = mamba_outputs[0]
 
-        torch.cuda.nvtx.range_push("lm head") 
         logits = self.lm_head(hidden_states.to(self.lm_head.weight.dtype)).float()
-        torch.cuda.nvtx.range_pop()
 
         loss = None
         if labels is not None:
@@ -804,5 +987,3 @@ class MambaForCausalLM(MambaPreTrainedModel):
             cache_params=mamba_outputs.cache_params,
             hidden_states=mamba_outputs.hidden_states,
         )
-
-
