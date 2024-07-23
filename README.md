@@ -24,6 +24,6 @@
 
 
 ## References
-https://github.com/huggingface/transformers/tree/main/src/transformers/models/mamba
+https://github.com/huggingface/transformers
 
 
